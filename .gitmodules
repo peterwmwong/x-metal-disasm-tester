@@ -1,0 +1,3 @@
+[submodule "extern/applegpu"]
+	path = extern/applegpu
+	url = https://github.com/dougallj/applegpu
