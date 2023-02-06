@@ -3,6 +3,7 @@ import Metal
 import MetalKit
 
 let APPLEGPU_DISASM_PY_PATH = Bundle.main.bundlePath + "/applegpu/disassemble.py"
+let DEBUGGING = false;
 
 @discardableResult func run_shell_command(_ command: String) throws -> String {
     let task = Process()
@@ -31,7 +32,6 @@ try run_shell_command("xcrun --show-sdk-path")
 try run_shell_command("xcrun xcodebuild -version")
 
 let device = MTLCreateSystemDefaultDevice()!
-//let gpu_bin_path = try FileManager.default.url(for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: FileManager.default.temporaryDirectory, create: true)
 var gpu_bin_path = FileManager.default.temporaryDirectory;
 gpu_bin_path.append(path: String(format: "%06X%06X", arc4random_uniform(65535), arc4random_uniform(65535)))
 
@@ -59,7 +59,9 @@ func generate_binary_archive(path: URL) throws {
     try archive.addRenderPipelineFunctions(descriptor: pipelineDesc)
     try archive.serialize(to: path)
 }
-try generate_binary_archive(path: gpu_bin_path)
+if !DEBUGGING {
+    try generate_binary_archive(path: gpu_bin_path)
+}
 
 func disasm(path: URL) throws {
     print("""
@@ -95,7 +97,9 @@ func disasm(path: URL) throws {
         try run_shell_command("python3 \(APPLEGPU_DISASM_PY_PATH) \(tmp_gpu_thin_bin_path_str) 0x\(addr)")
     }
 }
-try disasm(path: gpu_bin_path)
+if !DEBUGGING {
+    try disasm(path: gpu_bin_path)
+}
 
 func run_pipeline(path: URL) throws {
     print("""
@@ -105,8 +109,7 @@ func run_pipeline(path: URL) throws {
     -----------------------
 
     """)
-    
-    let lib = try! device.makeLibrary(URL: path);
+    let lib = DEBUGGING ? device.makeDefaultLibrary()! : try! device.makeLibrary(URL: path)
     let pipelineDesc = create_pipeline_descriptor(lib: lib);
     let pipeline = try! device.makeRenderPipelineState(descriptor: pipelineDesc)
     
@@ -114,7 +117,8 @@ func run_pipeline(path: URL) throws {
     let WIDTH = 4
     let HEIGHT = 4
 
-    let textureBuf = device.makeBuffer(length: 4 /* 4-bytes (rgba) */ * WIDTH * HEIGHT)!
+    let writeToTextureBytes = device.makeBuffer(length: 4 /* 4 bytes per component */ * 4 /* 4 components (rgba) */ * WIDTH * HEIGHT, options: .storageModeShared)!
+    
     let textureDesc = MTLTextureDescriptor()
     textureDesc.storageMode = .shared
     textureDesc.depth = 1
@@ -122,41 +126,58 @@ func run_pipeline(path: URL) throws {
     textureDesc.usage = .renderTarget
     textureDesc.width = WIDTH
     textureDesc.height = HEIGHT
-    let output = textureBuf.makeTexture(descriptor: textureDesc, offset: 0, bytesPerRow: 4 * WIDTH)
+    let renderToTexture = device.makeTexture(descriptor: textureDesc)
+    
+    textureDesc.pixelFormat = .rgba32Float
+    textureDesc.usage = .shaderWrite
+    let writeToTexture = device.makeTexture(descriptor: textureDesc)!
 
+    let captureManager = MTLCaptureManager.shared()
+    let captureDescriptor = MTLCaptureDescriptor()
+    captureDescriptor.captureObject = device
+    
+    if DEBUGGING {
+        try! captureManager.startCapture(with: captureDescriptor)
+    }
+    
     let queue = device.makeCommandQueue()!
     let command = queue.makeCommandBuffer()!
 
     let renderDesc = MTLRenderPassDescriptor()
     let color = renderDesc.colorAttachments[0]!
-    color.texture = output
+    color.texture = renderToTexture
     color.loadAction = .clear
     color.storeAction = .store
     color.clearColor = MTLClearColorMake(0, 0, 0, 0)
 
     let r = command.makeRenderCommandEncoder(descriptor: renderDesc)!
     r.setRenderPipelineState(pipeline)
-    r.drawPrimitives(type: .point, vertexStart: 0, vertexCount: 1)
+    r.setFragmentTexture(writeToTexture, index: 0)
+    r.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
     r.endEncoding()
-
+    
+    let b = command.makeBlitCommandEncoder()!
+    b.copy(from: writeToTexture, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOriginMake(0, 0, 0), sourceSize: MTLSizeMake(WIDTH, HEIGHT, 1), to: writeToTextureBytes, destinationOffset: 0, destinationBytesPerRow: 4 * 4 * WIDTH, destinationBytesPerImage: 4 * 4 * WIDTH * HEIGHT)
+    b.endEncoding()
     command.commit()
+    
+    if DEBUGGING {
+        captureManager.stopCapture()
+    }
     command.waitUntilCompleted()
-
-    let outputPixels = Array(textureBuf.contents().withMemoryRebound(to: (UInt8, UInt8, UInt8, UInt8).self, capacity: WIDTH * HEIGHT) {
-        UnsafeBufferPointer(start: $0, count: WIDTH * HEIGHT)
-    })
-
-    func printOutputPixels(_ arr: Array<(UInt8, UInt8, UInt8, UInt8)>) {
+    
+    func printVals(_ arr: Array<SIMD4<Float>>) {
         for y in 0..<HEIGHT {
-            var r: [UInt8] = []
+            var r: [SIMD4<Float>] = []
             for x in 0..<WIDTH {
-                r.append(arr[y * WIDTH + x].1)
+                r.append(arr[y * WIDTH + x]);
             }
             print(r)
         }
-
     }
-    printOutputPixels(outputPixels)
+    printVals(Array(writeToTextureBytes.contents().withMemoryRebound(to: SIMD4<Float>.self, capacity: WIDTH * HEIGHT) {
+        UnsafeBufferPointer(start: $0, count: WIDTH * HEIGHT)
+    }))
 }
 try run_pipeline(path: gpu_bin_path)
 
